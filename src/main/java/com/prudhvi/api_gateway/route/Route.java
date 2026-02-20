@@ -1,6 +1,7 @@
 package com.prudhvi.api_gateway.route;
 
 import jakarta.persistence.*;
+import lombok.Data;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
@@ -34,6 +35,13 @@ public class Route {
     // The base URL of the downstream service that requests are forwarded to.
     @Column(nullable = false)
     private String targetUrl;
+
+    // Token bucket rate limiting config. Both null means rate limiting is disabled for this route.
+    @Column(nullable = true)
+    private Integer capacity;           // max tokens in bucket (e.g. 100)
+
+    @Column(nullable = true)
+    private Integer refillRatePerSecond; // tokens added per second (e.g. 10)
 
     @Column(nullable = false, updatable = false)
     private LocalDateTime createdAt;

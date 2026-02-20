@@ -54,13 +54,19 @@ public class RouteController {
     }
 
     /**
-     * PUT /routes/{id}
-     * Updates an existing route's path and targetUrl.
-     * Returns 200 with the updated route, or 404 if the ID doesn't exist.
+     * PUT /routes or PUT /routes/{id}
+     * Updates an existing route. ID can be in the URL or in the request body.
+     * Returns 200 with the updated route, 400 if no ID supplied, 404 if not found.
      */
-    @PutMapping("/{id}")
-    public ResponseEntity<Route> update(@PathVariable Long id, @RequestBody Route incoming) {
-        return routeService.update(id, incoming)
+    @PutMapping({"", "/{id}"})
+    public ResponseEntity<Route> update(
+            @PathVariable(required = false) Long id,
+            @RequestBody Route incoming) {
+        Long resolvedId = (id != null) ? id : incoming.getId();
+        if (resolvedId == null) {
+            return ResponseEntity.badRequest().build();
+        }
+        return routeService.update(resolvedId, incoming)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }

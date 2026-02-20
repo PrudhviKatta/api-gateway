@@ -1,5 +1,9 @@
 package com.prudhvi.api_gateway.proxy;
 
+import com.prudhvi.api_gateway.accesslog.AccessLogEvent;
+import com.prudhvi.api_gateway.accesslog.AccessLogPublisher;
+import com.prudhvi.api_gateway.ratelimit.RateLimiterService;
+import com.prudhvi.api_gateway.ratelimit.RateLimiterService.RateLimitResult;
 import com.prudhvi.api_gateway.route.Route;
 import com.prudhvi.api_gateway.route.RouteCache;
 import jakarta.servlet.http.HttpServletRequest;
@@ -18,6 +22,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.time.Instant;
 import java.util.Enumeration;
 import java.util.Set;
 
@@ -49,13 +54,18 @@ public class ProxyController {
     );
 
     private final RouteCache routeCache;
+    private final RateLimiterService rateLimiterService;
+    private final AccessLogPublisher accessLogPublisher;
 
     // A single HttpClient is created once and reused. It manages its own
     // internal connection pool, so creating one per request would waste resources.
     private final HttpClient httpClient;
 
-    public ProxyController(RouteCache routeCache) {
+    public ProxyController(RouteCache routeCache, RateLimiterService rateLimiterService,
+                           AccessLogPublisher accessLogPublisher) {
         this.routeCache = routeCache;
+        this.rateLimiterService = rateLimiterService;
+        this.accessLogPublisher = accessLogPublisher;
         this.httpClient = HttpClient.newHttpClient();
     }
 
@@ -65,15 +75,18 @@ public class ProxyController {
      * Steps:
      * 1. Extract the request path and look it up in the route cache.
      * 2. If no route matches, return 404.
-     * 3. Build the target URL: targetUrl + requestPath + optional query string.
-     * 4. Copy the HTTP method, headers (minus hop-by-hop), and body.
-     * 5. Send the request synchronously.
-     * 6. Write the downstream status, headers, and body back to the caller.
+     * 3. Check rate limit for the (client IP, route) pair; return 429 if exceeded.
+     * 4. Build the target URL: targetUrl + requestPath + optional query string.
+     * 5. Copy the HTTP method, headers (minus hop-by-hop), and body.
+     * 6. Send the request synchronously.
+     * 7. Write the downstream status, headers, and body back to the caller.
      */
     @RequestMapping("/**")
     public void proxy(HttpServletRequest request, HttpServletResponse response) throws IOException {
 
         String requestPath = request.getRequestURI();
+        String method = request.getMethod().toUpperCase();
+        long startMs = System.currentTimeMillis();
 
         // --- Step 1: Route lookup ---
         Route route = routeCache.findMatch(requestPath).orElse(null);
@@ -82,10 +95,40 @@ public class ProxyController {
             response.setStatus(HttpServletResponse.SC_NOT_FOUND);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             response.getWriter().write("{\"error\": \"No route found for path: " + requestPath + "\"}");
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), extractClientIp(request), method, requestPath,
+                    null, HttpServletResponse.SC_NOT_FOUND,
+                    System.currentTimeMillis() - startMs, false));
             return;
         }
 
-        // --- Step 2: Build the target URL ---
+        // --- Step 2: Rate limit check ---
+        // Client identity = IP address. Each (IP, route) pair has its own token bucket.
+        String clientIp = extractClientIp(request);
+        RateLimitResult rateLimitResult = rateLimiterService.check(clientIp, route);
+
+        if (!rateLimitResult.allowed()) {
+            response.setStatus(429);
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.setHeader("X-RateLimit-Limit", String.valueOf(route.getCapacity()));
+            response.setHeader("X-RateLimit-Remaining", "0");
+            response.setHeader("Retry-After", "1");
+            response.getWriter().write("{\"error\": \"Rate limit exceeded\"}");
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), clientIp, method, requestPath,
+                    route.getTargetUrl(), 429,
+                    System.currentTimeMillis() - startMs, true));
+            return;
+        }
+
+        // Add informational rate-limit headers on allowed requests.
+        // Skip the headers when no rate limiting is configured (remaining == -1).
+        if (route.getCapacity() != null) {
+            response.setHeader("X-RateLimit-Limit", String.valueOf(route.getCapacity()));
+            response.setHeader("X-RateLimit-Remaining", String.valueOf(rateLimitResult.remaining()));
+        }
+
+        // --- Step 4: Build the target URL ---
         // Combine the downstream base URL with the original path (and query string if present).
         String queryString = request.getQueryString();
         String targetUrl = route.getTargetUrl() + requestPath
@@ -93,7 +136,7 @@ public class ProxyController {
 
         log.debug("Proxying {} {} -> {}", request.getMethod(), requestPath, targetUrl);
 
-        // --- Step 3: Build the outbound HttpRequest ---
+        // --- Step 5: Build the outbound HttpRequest ---
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(targetUrl));
 
@@ -110,13 +153,12 @@ public class ProxyController {
         // raw InputStream directly without buffering the full body in memory.
         // We extract the InputStream first because getInputStream() throws IOException,
         // which is incompatible with the Supplier<InputStream> functional interface.
-        String method = request.getMethod().toUpperCase();
         var bodyStream = request.getInputStream();
         requestBuilder.method(method, HttpRequest.BodyPublishers.ofInputStream(() -> bodyStream));
 
         HttpRequest outboundRequest = requestBuilder.build();
 
-        // --- Step 4: Send the request and relay the response ---
+        // --- Step 6: Send the request and relay the response ---
         try {
             HttpResponse<byte[]> downstreamResponse =
                     httpClient.send(outboundRequest, BodyHandlers.ofByteArray());
@@ -124,9 +166,11 @@ public class ProxyController {
             // Set the status code from the downstream response.
             response.setStatus(downstreamResponse.statusCode());
 
-            // Forward response headers, again skipping hop-by-hop.
+            // Forward response headers, skipping hop-by-hop and HTTP/2 pseudo-headers.
+            // Pseudo-headers (:status, :path, etc.) are HTTP/2-only framing metadata —
+            // they must never appear in an HTTP/1.1 response sent back to the client.
             downstreamResponse.headers().map().forEach((name, values) -> {
-                if (!HOP_BY_HOP_HEADERS.contains(name.toLowerCase())) {
+                if (!name.startsWith(":") && !HOP_BY_HOP_HEADERS.contains(name.toLowerCase())) {
                     values.forEach(value -> response.addHeader(name, value));
                 }
             });
@@ -134,16 +178,47 @@ public class ProxyController {
             // Write the response body bytes back to the caller.
             response.getOutputStream().write(downstreamResponse.body());
 
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), clientIp, method, requestPath,
+                    route.getTargetUrl(), downstreamResponse.statusCode(),
+                    System.currentTimeMillis() - startMs, false));
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             response.getWriter().write("{\"error\": \"Proxy request interrupted\"}");
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), clientIp, method, requestPath,
+                    route.getTargetUrl(), HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
+                    System.currentTimeMillis() - startMs, false));
         } catch (Exception e) {
-            log.error("Proxy error for {} {}: {}", request.getMethod(), requestPath, e.getMessage());
+            log.error("Proxy error for {} {}: {}", method, requestPath, e.getMessage());
             response.setStatus(HttpServletResponse.SC_BAD_GATEWAY);
             response.setContentType(MediaType.APPLICATION_JSON_VALUE);
             response.getWriter().write("{\"error\": \"Bad gateway: " + e.getMessage() + "\"}");
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), clientIp, method, requestPath,
+                    route.getTargetUrl(), HttpServletResponse.SC_BAD_GATEWAY,
+                    System.currentTimeMillis() - startMs, false));
         }
+    }
+
+    /**
+     * Extracts the originating client IP address.
+     *
+     * When the gateway sits behind a reverse proxy or load balancer (e.g. nginx,
+     * AWS ALB), the actual client IP is passed in the X-Forwarded-For header.
+     * That header may contain a comma-separated chain of IPs — the first one is
+     * always the original client. We fall back to the TCP remote address when
+     * the header is absent (direct connections or local development).
+     */
+    private String extractClientIp(HttpServletRequest request) {
+        String forwarded = request.getHeader("X-Forwarded-For");
+        if (forwarded != null && !forwarded.isBlank()) {
+            // "X-Forwarded-For: client, proxy1, proxy2" — take the first entry
+            return forwarded.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
     }
 }

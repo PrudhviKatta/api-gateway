@@ -59,6 +59,8 @@ public class RouteService {
         return routeRepository.findById(id).map(existing -> {
             existing.setPath(incoming.getPath());
             existing.setTargetUrl(incoming.getTargetUrl());
+            existing.setCapacity(incoming.getCapacity());
+            existing.setRefillRatePerSecond(incoming.getRefillRatePerSecond());
             Route saved = routeRepository.save(existing);
             routeCache.refresh();
             return saved;
