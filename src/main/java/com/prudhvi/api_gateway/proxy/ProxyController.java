@@ -2,10 +2,13 @@ package com.prudhvi.api_gateway.proxy;
 
 import com.prudhvi.api_gateway.accesslog.AccessLogEvent;
 import com.prudhvi.api_gateway.accesslog.AccessLogPublisher;
+import com.prudhvi.api_gateway.circuitbreaker.CircuitBreakerService;
 import com.prudhvi.api_gateway.ratelimit.RateLimiterService;
 import com.prudhvi.api_gateway.ratelimit.RateLimiterService.RateLimitResult;
 import com.prudhvi.api_gateway.route.Route;
 import com.prudhvi.api_gateway.route.RouteCache;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
@@ -56,16 +59,19 @@ public class ProxyController {
     private final RouteCache routeCache;
     private final RateLimiterService rateLimiterService;
     private final AccessLogPublisher accessLogPublisher;
+    private final CircuitBreakerService circuitBreakerService;
 
     // A single HttpClient is created once and reused. It manages its own
     // internal connection pool, so creating one per request would waste resources.
     private final HttpClient httpClient;
 
     public ProxyController(RouteCache routeCache, RateLimiterService rateLimiterService,
-                           AccessLogPublisher accessLogPublisher) {
+                           AccessLogPublisher accessLogPublisher,
+                           CircuitBreakerService circuitBreakerService) {
         this.routeCache = routeCache;
         this.rateLimiterService = rateLimiterService;
         this.accessLogPublisher = accessLogPublisher;
+        this.circuitBreakerService = circuitBreakerService;
         this.httpClient = HttpClient.newHttpClient();
     }
 
@@ -159,9 +165,13 @@ public class ProxyController {
         HttpRequest outboundRequest = requestBuilder.build();
 
         // --- Step 6: Send the request and relay the response ---
+        // The circuit breaker wraps the actual HTTP send. If the breaker is OPEN
+        // (too many recent failures), executeCheckedSupplier throws
+        // CallNotPermittedException immediately — no network call is made.
+        CircuitBreaker breaker = circuitBreakerService.forRoute(route.getPath());
         try {
-            HttpResponse<byte[]> downstreamResponse =
-                    httpClient.send(outboundRequest, BodyHandlers.ofByteArray());
+            HttpResponse<byte[]> downstreamResponse = breaker.executeCheckedSupplier(
+                    () -> httpClient.send(outboundRequest, BodyHandlers.ofByteArray()));
 
             // Set the status code from the downstream response.
             response.setStatus(downstreamResponse.statusCode());
@@ -183,6 +193,15 @@ public class ProxyController {
                     route.getTargetUrl(), downstreamResponse.statusCode(),
                     System.currentTimeMillis() - startMs, false));
 
+        } catch (CallNotPermittedException e) {
+            // Circuit is OPEN — fast-fail without touching the downstream service.
+            response.setStatus(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.getWriter().write("{\"error\": \"Circuit open — service unavailable\"}");
+            accessLogPublisher.publish(new AccessLogEvent(
+                    Instant.now(), clientIp, method, requestPath,
+                    route.getTargetUrl(), HttpServletResponse.SC_SERVICE_UNAVAILABLE,
+                    System.currentTimeMillis() - startMs, false));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
@@ -201,6 +220,8 @@ public class ProxyController {
                     Instant.now(), clientIp, method, requestPath,
                     route.getTargetUrl(), HttpServletResponse.SC_BAD_GATEWAY,
                     System.currentTimeMillis() - startMs, false));
+        } catch (Throwable e) {
+            throw new RuntimeException(e);
         }
     }
 
