@@ -37,3 +37,7 @@ CLAUDE.md
 
 ### Nested duplicate directory ###
 api-gateway/
+
+### React dashboard ###
+dashboard/node_modules/
+dashboard/dist/
